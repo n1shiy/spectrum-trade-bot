@@ -1,12 +1,17 @@
 import logging
 from datetime import datetime, timedelta
 import sqlite3
+from dotenv import load_dotenv
+load_dotenv(dotenv_path="TELEGRAM_BOT_TOKEN.env")
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, ReplyKeyboardMarkup
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, CallbackContext, ConversationHandler, CallbackQueryHandler
 from telegram.ext import ContextTypes
 import re
 from telegram import ReplyKeyboardRemove
 import os
+import hashlib
+import smtplib
+from email.mime.text import MIMEText
 
 logging.basicConfig(
     format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
@@ -15,7 +20,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Константы для состояний ConversationHandler
-CHOOSING_SERVICE, GETTING_CONTACT, CHOOSING_DATE, CHOOSING_TIME, DESCRIPTION, CONFIRM_BOOKING = range(6)
+CHOOSING_SERVICE, GETTING_CONTACT, CHOOSING_DATE, CHOOSING_TIME, DESCRIPTION, CONFIRM_BOOKING, GETTING_EMAIL_AFTER_CONFIRM = range(7)
 ADMIN_AUTH, ADMIN_ACTION, VIEW_BOOKINGS, ADD_SERVICE, REMOVE_SERVICE = range(5, 10)
 
 # Константы для типов обратных вызовов
@@ -25,6 +30,12 @@ TIME_CALLBACK = "time_"
 CONFIRM_CALLBACK = "confirm_"
 ADMIN_CALLBACK = "admin_"
 DELETE_BOOKING = "delete_"
+ADMIN_CHAT_ID = 966063834 
+SMTP_SERVER = 'smtp.yandex.ru'
+SMTP_PORT = 465
+EMAIL_SENDER = 'SpectrumTradeBot@yandex.ru'
+EMAIL_PASSWORD = 'dkhcateivqohiuhg'
+EMAIL_RECEIVER = 'spectrumtradebot@gmail.com'
 
 
     # Инициализация базы данных
@@ -113,6 +124,9 @@ def get_services():
     conn.close()
     return services
 
+def hash_phone_number(phone: str) -> str:
+    return hashlib.sha256(phone.encode('utf-8')).hexdigest()
+
 # Получение информации об услуге по ID
 def get_service_by_id(service_id):
     conn = sqlite3.connect('autoservice_bot.db')
@@ -143,10 +157,15 @@ def remove_service(service_id):
 def create_booking(user_id, user_name, phone_number, service_id, service_name, date, time, description):
     conn = sqlite3.connect('autoservice_bot.db')
     cursor = conn.cursor()
+
+    # Хэшируем номер
+    hashed_phone = hash_phone_number(phone_number)
+
     cursor.execute('''
     INSERT INTO bookings (user_id, user_name, phone_number, service_id, service_name, date, time, description)
     VALUES (?, ?, ?, ?, ?, ?, ?, ?)
-    ''', (user_id, user_name, phone_number, service_id, service_name, date, time, description))
+    ''', (user_id, user_name, hashed_phone, service_id, service_name, date, time, description))
+    
     booking_id = cursor.lastrowid
     conn.commit()
     conn.close()
@@ -308,8 +327,8 @@ async def info_command(update: Update, context: CallbackContext) -> None:
     await update.message.reply_text(
         "🔧 *Автосервис \"Спектр-трейд\"* 🔧\n\n"
         "*Адрес:* г.Омск ул. 2-я Барнаульская, 63А\n"
-        "*Телефон:* +7 (999) 9999999\n"
-        "*Часы работы:* Ежедневно с 8:00 до 20:00\n\n"
+        "*Телефон:* +7 983 626-83-65\n"
+        "*Часы работы:* Пн-Пт с 8:00 до 20:00 Сб с 8:00 до 14:00\n\n"
         "*Наши услуги:*\n"
         "- Диагностика и ремонт\n"
         "- Техническое обслуживание\n"
@@ -405,6 +424,53 @@ async def service_choice(update: Update, context: CallbackContext) -> int:
     
     return GETTING_CONTACT
 
+def send_email(phone_number, user_name, service_name, date, time):
+    body = (
+        f"📞 Новая заявка\n\n"
+        f"Имя: {user_name}\n"
+        f"Телефон: {phone_number}\n"
+        f"Услуга: {service_name}\n"
+        f"Дата: {date}\n"
+        f"Время: {time}"
+    )
+
+    msg = MIMEText(body)
+    msg['Subject'] = 'Заявка от клиента'
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = EMAIL_RECEIVER
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print("Email отправлен.")
+    except Exception as e:
+        print("Ошибка отправки email:", e)
+
+def send_email_to_client(email, user_name, service_name, date, time):
+    body = (
+        f"Здравствуйте, {user_name}!\n\n"
+        f"Вы записались на услугу: {service_name}\n"
+        f"Дата: {date}\n"
+        f"Время: {time}\n\n"
+        f"Спасибо, что выбрали наш автосервис!"
+    )
+
+    msg = MIMEText(body)
+    msg['Subject'] = 'Подтверждение вашей записи'
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = email
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"Email отправлен клиенту: {email}")
+    except Exception as e:
+        print(f"Ошибка при отправке email клиенту: {e}")
+
 # Обработка получения контакта
 async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     user = update.message.from_user
@@ -426,6 +492,9 @@ async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
     context.user_data['booking_data']['phone_number'] = phone_number
     context.user_data['booking_data']['user_name'] = user.first_name
 
+    # Получаем данные из контекста
+    booking = context.user_data['booking_data']
+
     if update.message:
         await update.message.reply_text(
         "Спасибо, информация сохранена.",
@@ -434,13 +503,23 @@ async def get_contact(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     # Генерация выбора даты
     keyboard = []
-    today = datetime.now()
+    today = datetime.now().date()
+    added = 0
+    i = 1  # начинаем с завтрашнего дня
 
-    for i in range(7):
+# Добавим максимум 7 рабочих дней (Пн–Сб), исключая воскресенье (6)
+    while added < 7:
         booking_date = today + timedelta(days=i)
-        date_str = booking_date.strftime("%d.%m.%Y")
-        date_callback = booking_date.strftime("%Y-%m-%d")
-        keyboard.append([InlineKeyboardButton(date_str, callback_data=f"{DATE_CALLBACK}{date_callback}")])
+        weekday = booking_date.weekday()  # 0 - Пн, ..., 6 - Вс
+
+        if weekday < 6:  # Пн–Сб
+            date_str = booking_date.strftime("%d.%m.%Y")
+            date_callback = booking_date.strftime("%Y-%m-%d")
+            keyboard.append([InlineKeyboardButton(date_str, callback_data=f"{DATE_CALLBACK}{date_callback}")])
+            added += 1  # ← только когда день подходит — добавляем
+
+        i += 1  # ← обязательно двигаем к следующему дню
+
 
     reply_markup = InlineKeyboardMarkup(keyboard)
 
@@ -485,9 +564,16 @@ async def date_choice(update: Update, context: CallbackContext) -> int:
     conn.close()
 
     # Генерируем доступное время
-    start_hour = 8
-    end_hour = 19
-    interval = 1
+    weekday = datetime.strptime(date_str, "%Y-%m-%d").weekday()
+
+    interval = 1  # Общий интервал (для всех дней)
+
+    if weekday == 5:  # Суббота
+        start_hour = 8
+        end_hour = 14
+    else:
+        start_hour = 8
+        end_hour = 19
 
     keyboard = []
     for hour in range(start_hour, end_hour, interval):
@@ -724,6 +810,58 @@ async def delete_user_booking(update: Update, context: CallbackContext) -> None:
         return
 
     booking_id = int(query.data.replace(DELETE_BOOKING, ""))
+
+    # Получаем данные об удаляемой записи
+    conn = sqlite3.connect('autoservice_bot.db')
+    cursor = conn.cursor()
+    cursor.execute('''
+    SELECT user_name, phone_number, service_name, date, time, description
+    FROM bookings WHERE id = ?
+    ''', (booking_id,))
+    booking = cursor.fetchone()
+    conn.close()
+
+    if booking:
+        user_name, phone, service, date, time, description = booking
+
+    # Уведомление по email
+        try:
+            body = (
+                f"❌ Заявка отменена\n\n"
+                f"Имя: {user_name}\n"
+                f"Услуга: {service}\n"
+                f"Дата: {date}\n"
+                f"Время: {time}\n"
+                f"Описание: {description}"
+            )
+
+            msg = MIMEText(body)
+            msg['Subject'] = f'❌ Отмена заявки #{booking_id}'
+            msg['From'] = EMAIL_SENDER
+            msg['To'] = EMAIL_RECEIVER
+
+            server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+            server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+            server.send_message(msg)
+            server.quit()
+            print(f"Email об отмене отправлен админу.")
+        except Exception as e:
+            print(f"Ошибка при отправке email админу: {e}")
+
+    # Уведомление в Telegram
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=(
+            f"❌ *Заявка отменена*\n\n"
+            f"*Имя:* {user_name}\n"
+            f"*Услуга:* {service}\n"
+            f"*Дата:* {date}\n"
+            f"*Время:* {time}\n"
+            f"*Описание:* {description}"
+        ),
+        parse_mode='Markdown'
+    )
+
     cancel_booking_by_id(booking_id)
 
     # Повторно получаем обновлённый список записей
@@ -830,7 +968,6 @@ async def admin_actions(update: Update, context: CallbackContext) -> None:
             message += (
                 f"*Запись #{booking_id}*\n"
                 f"Клиент: {user_name}\n"
-                f"Телефон: {phone}\n"
                 f"Услуга: {service}\n"
                 f"Дата и время: {date} в {time}\n"
                 f"Описание: {description}\n"
@@ -1037,6 +1174,14 @@ async def confirm_booking_from_text(query, update: Update, context: CallbackCont
         booking_data['time'],
         booking_data['description']
     )
+    if 'email' in booking_data:
+        send_email_to_client(
+        booking_data['email'],
+        booking_data['user_name'],
+        booking_data['service_name'],
+        booking_data['date'],
+        booking_data['time']
+    )
 
     main_menu = ReplyKeyboardMarkup(
     [["🏠 Главное меню"]],
@@ -1055,10 +1200,124 @@ async def confirm_booking_from_text(query, update: Update, context: CallbackCont
 
     await query.message.reply_text("Для возврата в главное меню нажмите кнопку 🏠 Главное меню", reply_markup=main_menu)
 
+    # Уведомление администратора
+    send_email(
+        booking_data['phone_number'],
+        booking_data['user_name'],
+        booking_data['service_name'],
+        booking_data['date'],
+        booking_data['time']
+    )
+
+    await context.bot.send_message(
+        chat_id=ADMIN_CHAT_ID,
+        text=(
+            f"📞 Новая подтверждённая заявка\n\n"
+            f"Имя: {booking_data['user_name']}\n"
+            f"Телефон: {booking_data['phone_number']}\n"
+            f"Услуга: {booking_data['service_name']}\n"
+            f"Дата: {booking_data['date']}\n"
+            f"Время: {booking_data['time']}\n"
+            f"Описание: {booking_data['description']}"
+        )
+    )
+
+    # Предложение пользователю ввести email
+    keyboard = ReplyKeyboardMarkup(
+        [["Нет, вернуться в 🏠Главное меню"]],
+        resize_keyboard=True,
+        one_time_keyboard=True
+    )
+
+    await query.message.reply_text(
+        "Если хотите получить копию вашей записи на электронную почту, пожалуйста введите email в формате example@mail.ru.\n\n"
+        "Или нажмите кнопку ниже, чтобы вернуться в главное меню.",
+        reply_markup=keyboard
+    )
+
+    # Сохраняем данные бронирования
+    context.user_data['last_booking'] = {
+        'user_name': booking_data['user_name'],
+        'service_name': booking_data['service_name'],
+        'date': booking_data['date'],
+        'time': booking_data['time']
+    }
+
+    # Очищаем booking_data
     if 'booking_data' in context.user_data:
         context.user_data.pop('booking_data')
 
+    return GETTING_EMAIL_AFTER_CONFIRM
+
+async def handle_email_or_skip(update: Update, context: CallbackContext) -> int:
+    text = update.message.text.strip()
+
+    if text.lower() == "нет, вернуться в главное меню":
+        await update.message.reply_text(
+            "Хорошо! Возвращаю вас в главное меню.✅",
+            reply_markup=ReplyKeyboardMarkup(
+                [["📅 Записаться", "📝 Мои записи"], ["ℹ️ О сервисе", "❓ Помощь"]],
+                resize_keyboard=True
+            )
+        )
+        return ConversationHandler.END
+
+    # Проверка email
+    if not re.fullmatch(r"[^@ \t\r\n]+@[^@ \t\r\n]+\.[^@ \t\r\n]+", text):
+        await update.message.reply_text(
+            "Некорректный email. Попробуйте снова или нажмите кнопку ниже для возврата.",
+            reply_markup=ReplyKeyboardMarkup(
+                [["Нет, вернуться в главное меню"]],
+                resize_keyboard=True
+            )
+        )
+        return GETTING_EMAIL_AFTER_CONFIRM
+
+    # Отправка письма
+    booking = context.user_data.get('last_booking')
+    if booking:
+        send_email_to_client(
+            text,
+            booking['user_name'],
+            booking['service_name'],
+            booking['date'],
+            booking['time']
+        )
+
+    await update.message.reply_text(
+        "✅ Копия вашей записи отправлена на почту.",
+        reply_markup=ReplyKeyboardMarkup(
+            [["📅 Записаться", "📝 Мои записи"], ["ℹ️ О сервисе", "❓ Помощь"]],
+            resize_keyboard=True
+        )
+    )
+
+    context.user_data.pop('last_booking', None)
     return ConversationHandler.END
+
+def send_email_to_client(email, user_name, service_name, date, time):
+    body = (
+        f"Здравствуйте, {user_name}!\n\n"
+        f"Вы записались на услугу: {service_name}\n"
+        f"Дата: {date}\n"
+        f"Время: {time}\n\n"
+        f"Если вы хотите изменить или отменить запись — свяжитесь с нами.\n\n"
+        f"Спасибо, что выбрали наш автосервис!"
+    )
+
+    msg = MIMEText(body)
+    msg['Subject'] = 'Подтверждение вашей записи'
+    msg['From'] = EMAIL_SENDER
+    msg['To'] = email
+
+    try:
+        server = smtplib.SMTP_SSL(SMTP_SERVER, SMTP_PORT)
+        server.login(EMAIL_SENDER, EMAIL_PASSWORD)
+        server.send_message(msg)
+        server.quit()
+        print(f"Email отправлен клиенту: {email}")
+    except Exception as e:
+        print(f"Ошибка при отправке email клиенту: {e}")
 
 async def show_feedbacks(update: Update, context: CallbackContext) -> None:
     conn = sqlite3.connect('autoservice_bot.db')
@@ -1080,6 +1339,8 @@ async def show_feedbacks(update: Update, context: CallbackContext) -> None:
     reply_markup = ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
     await update.message.reply_text(text, reply_markup=reply_markup, parse_mode="Markdown")
+
+
     
 
 # Запуск бота
@@ -1090,7 +1351,7 @@ def main() -> None:
     init_db()
     
     # Получение токена из переменной окружения или напрямую
-    token = "8178577242:AAGuAaqWMuBm2wp2zXVNnI8ebcnJ8Z8YSZM"
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
     
     # Создание приложения
     application = Application.builder().token(token).build()
@@ -1144,11 +1405,15 @@ def main() -> None:
             CommandHandler("skip", skip_description),
             MessageHandler(filters.TEXT & ~filters.COMMAND, get_description),
         ],
+        
         CONFIRM_BOOKING: [
             CallbackQueryHandler(confirm_booking),
             MessageHandler(filters.TEXT & filters.Regex("^✅ Подтвердить$"), confirm_booking_text),
             MessageHandler(filters.TEXT & filters.Regex("^❌ Отменить оформление заявки$"), cancel),
         ],
+        GETTING_EMAIL_AFTER_CONFIRM: [
+    MessageHandler(filters.TEXT & ~filters.COMMAND, handle_email_or_skip)
+],
     },
     fallbacks=[
         CommandHandler("cancel", cancel),
